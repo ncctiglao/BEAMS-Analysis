@@ -1,0 +1,329 @@
+##################################################
+### R project to process SafeTravelPH vehicle feeds
+### Developed by Noriel Christopher C. Tiglao
+### 26 Jan 2021
+### Update 11 Feb 2021
+##################################################
+
+#install packages
+install.packages("ggplot2")
+install.packages("tidyverse")
+install.packages("dbscan")
+install.packages("sp")
+install.packages("dplyr")
+install.packages("rgdal")
+install.packages("geosphere")
+install.packages("leaflet")
+install.packages("leaflet.extras")
+install.packages("cluster")
+install.packages("factoextra")
+
+
+#load packages
+library(ggplot2)
+library(tidyverse)
+library(dbscan)
+library(sp)
+library(dplyr)
+library(rgdal)
+library(lubridate)
+library(geosphere)
+library(leaflet)
+library(leaflet.extras)
+
+
+#use integer, not scientific formatting
+options(scipen=999)
+
+
+######################################
+### read vehicle feeds into dataframe
+######################################
+
+#get working directory
+workdir <- getwd()
+
+
+# data for 2021-11-23
+df <- read.csv(paste(workdir, "2020-11-23\\Espina.csv", sep="\\"), header=FALSE)
+#df <- read.csv(paste(workdir, "2020-11-23\\Juavan.csv", sep="\\"), header=FALSE)
+#df <- read.csv(paste(workdir, "2020-11-23\\Manguiran.csv", sep="\\"), header=FALSE)
+#df <- read.csv(paste(workdir, "2020-11-23\\Pastolero.csv", sep="\\"), header=FALSE)
+
+#add header
+headers <- c("Id","Deviceid","Lat","Lng","Userid","Vehicleid","Vehicledetails","Board","Alight","Numpass","Date","Time")
+colnames(df) <- headers
+head(df)
+
+
+#remove rows with null coordinates
+df <- df %>% dplyr::filter(!is.na(Lng) | !is.na(Lat))
+
+
+#create Datetime column
+#df$Datetime <- dmy_hms(paste(df$Date, df$Time))
+df$Datetime <- ymd_hms(paste(df$Date, df$Time))
+
+#arrange rows by Datetime
+df2 <- df %>%
+  mutate(Datetime = ymd_hms(Datetime),
+         Hour = as.numeric(hour(Datetime)),
+         Min = as.numeric(minute(Datetime)),
+         Sec = as.numeric(second(Datetime))) %>%
+  arrange(Hour, Min, Sec) 
+
+
+#add Feedno column
+df2 <- df2 %>% mutate(Feedno = 1:n())
+
+
+#flag rows with non-zero Numpass
+#if Numpass is non-zero then Withpass is set to 1, else 2 (to facilitate ordering)
+df2 <- df2 %>% mutate(
+  Withpass = ifelse(Numpass > 0, 1, 2))
+
+
+#flag rows with board or alight event
+#if Board or Alight is TRUE then Event is set to 1, else 2 (to facilitate ordering)
+df2$Board <- toupper(df2$Board)
+df2$Alight <- toupper(df2$Alight)
+df2 <- df2 %>% mutate(
+  Withevent = ifelse(Board == "TRUE", 1, ifelse(Alight == "TRUE", 1, 2)))
+
+
+#arrange rows
+df3 <- df2 %>%
+  group_by(Datetime, Withpass, Withevent) %>%
+  filter(row_number(`Datetime`) == 1)%>%
+  arrange(Datetime, Withpass, Withevent, Numpass) 
+
+
+df4 <- df3 %>%
+  group_by(Datetime, Withevent) %>%
+  filter(row_number(`Datetime`) == 1)
+
+
+#correct Numpass values
+df5 <- df4 %>% add_column(Pass = 0)
+df5 <- df4 %>% add_column(Cumpass = 0)
+
+df5 <- df5 %>%
+  group_by(Userid) %>%
+  mutate(Pass = case_when(
+    Board == "TRUE" ~ 1,
+    Alight == "TRUE" ~ -1,
+    TRUE ~ 0))
+
+df5 <- df5 %>%
+  mutate(Cumpass = cumsum(Pass))
+
+
+######################################
+### extract vehicle coordinates
+######################################
+vehicle_coords <- df5 %>%
+  dplyr::transmute(                      # create new columns and drop all the others
+    Lng = as.numeric(as.character(Lng)), # make this text column numeric
+    Lat = as.numeric(as.character(Lat))
+  ) %>% 
+  dplyr::rename(Longitude = Lng, Latitude = Lat)  # rename
+
+
+#remove unwanted columns
+vehicle_coords$Userid <- NULL
+
+
+#extract vehicle data
+vehicle_data <- df5 %>% dplyr::select(-Lng, -Lat)
+
+######################################
+### create spatial data frame
+######################################
+vehicle_spdf <- sp::SpatialPointsDataFrame(  # create a SPDF
+  coords = vehicle_coords,                   # the vehicle co-ordinates
+  data = vehicle_data,                       # the vehicle data
+  proj4string = CRS("+init=epsg:4326")       # WGS84 geographic projection
+  ) %>% 
+  sp::spTransform(CRS("+init=epsg:32651"))   # re-project to UTM Zone 51N
+
+
+######################################
+### perform clustering using DBSCAN
+######################################
+#cl <- dbscan(vehicle_coords, eps = .5, minPts = 15)
+
+
+######################################
+### perform clustering using HDBSCAN
+######################################
+#cl <- hdbscan(vehicle_coords, minPts = 15)
+#plot(vehicle_coords, col=cl$cluster+1, pch=20)
+#plot(cl, gradient = c("yellow", "orange", "red", "blue"))
+#print(cl$cluster_scores)
+#head(cl$membership_prob)
+
+
+#compute distance using Haversine formula
+df6 <- df5 %>% add_column(Distance = 0)
+df6$Distance[2:nrow(df6)] <- sapply(2:nrow(df6), 
+                                  function(x) distm(df5[x-1,c('Lng', 'Lat')], df5[x,c('Lng', 'Lat')], fun = distHaversine))
+df6$Distance <- as.numeric(format(df6$Distance, decimal.mark = ".", digits = 2))
+
+
+#compute time difference
+df7 <- df6 %>%
+  add_column(Timediff = 0) %>% 
+  group_by(Userid) %>% 
+  mutate(Timediff=difftime(strptime(Datetime, "%Y-%m-%d %H:%M:%S"), strptime(lag(Datetime), "%Y-%m-%d %H:%M:%S")), Timediff=as.numeric(Timediff, units = 'secs'))
+
+#compute segment speed in kph
+df8 <- df7 %>%
+  add_column(Speed = 0) %>% 
+  mutate(Speed = Distance/Timediff * 3.6)
+
+df8$Speed <- as.numeric(format(df8$Speed, decimal.mark = ".", digits = 2))
+
+#replace NA with 0
+df8$Speed[is.na(df8$Speed)] <- 0
+df8$Timediff[is.na(df8$Timediff)] <- 0
+
+#replace Inf with 0
+df8$Speed[is.infinite(df8$Speed)] <- 0
+
+
+#plot the occupancy
+#--cleaned data * needs to be improved
+plot(df5$Cumpass~as.POSIXct(df5$Time, format="%H:%M:%S"), type="l",col="blue", xlab="Time", ylab="Passengers")
+#--raw data --> alternative
+plot(df$Numpass~as.POSIXct(df$Time, format="%H:%M:%S"), type="l",col="blue", xlab="Time", ylab="Passengers")
+
+
+######################################
+### compute metrics
+######################################
+#--boarding and alighting per hour
+Stats_Loading <- df8 %>%
+  group_by(Hour) %>%
+  summarize(
+    n = n(),
+    Total_Board = sum(Board=="TRUE", na.rm=T),
+    Total_Alight = sum(Alight=="TRUE", na.rm=T)
+  )
+
+#--average passengers per hour
+Stats_Pass <- df8 %>%
+  group_by(Hour) %>%
+  summarize(
+    n = n(),
+    Ave_Numpass = mean(Numpass, na.rm=T)
+  )
+
+#--average speed per hour >>>for checking!
+Stats_Speed <- df8 %>%
+  group_by(Hour) %>%
+  summarize(
+    n = n(),
+    Ave_Speed = mean(Speed)
+  )
+
+#--distance traveled per hour in km
+Stats_Distance <- df8 %>%
+  group_by(Hour) %>%
+  summarize(
+    n = n(),
+    Total_Distance = sum(Distance, na.rm=T) / 1000
+  )
+
+
+#--key stats
+TotalDistance <- sum(df8$Distance) / 1000
+AverageSpeed <- mean(df8$Speed)
+TotalBoard <- sum(Stats_Loading$Total_Board)
+TimeStart <- min(df8$Datetime)
+TimeEnd <- max(df8$Datetime)
+TimeDuration <- as.numeric(difftime(TimeEnd,TimeStart, units="hours"))
+
+#plot the speed
+plot(df8$Speed~as.POSIXct(df4$Time, format="%H:%M:%S"), type="l",col="blue", xlab="Time", ylab="Speed")
+
+
+######################################
+### create maps
+######################################
+#--plot tracks
+leaflet(df8) %>% addTiles() %>%
+  addProviderTiles(providers$OpenStreetMap, group = 'OpenStreetMap')  %>%
+  addCircleMarkers(lng = ~Lng, lat = ~Lat, radius = 0.5, fillOpacity = 0.5,
+                   popup = ~Numpass)
+
+
+#flag map group for board and alight points
+#if Board point then mapgroup is 1 else if Alight point then mapgroup is 2
+df8 <- df8 %>% 
+  mutate(Mapgroup = ifelse(Board == "TRUE", "Board", ifelse(Alight == "TRUE", "Alight", "Tracks")))
+
+
+###boarding and alighting map
+groups = as.character(unique(df8$Mapgroup))
+colorsmap = colors()[1:length(unique(df8$Mapgroup))]
+groupColors = colorFactor(palette = c("red", "green", "blue"), domain = df8$Mapgroup)
+
+map = leaflet(df8) %>% addTiles(group = "OpenStreetMap")
+for(g in groups){
+  d = df8[df8$Mapgroup == g, ]
+  map = map %>% addCircleMarkers(data = d, lng = ~Lng, lat = ~Lat, radius = 1, fillOpacity = 1,
+                                 color = ~groupColors(Mapgroup),
+                                 group = g)
+}
+
+map %>% addLayersControl(overlayGroups = groups) %>% 
+addLegend(
+  data = df8,
+  "bottomright", 
+  pal = groupColors,
+  values = ~Mapgroup,
+  opacity = .9,
+  title = "Type"
+)
+
+
+### combined board and alight and occupancy heatmap
+mypal <- colorBin("Spectral", domain = df8$Numpass, na.color = "transparent", reverse = TRUE)
+map %>% 
+  addTiles() %>% 
+  addHeatmap(lng = ~Lng, lat = ~Lat, intensity = ~Numpass,
+             blur = 20, max = 100, radius = 5, cellSize = 3) %>% 
+  addLayersControl(overlayGroups = groups) %>% 
+  addLegend(
+    data = df8,
+    "bottomright", 
+    pal = groupColors,
+    values = ~Mapgroup,
+    opacity = .9,
+    title = "Type"
+  )
+
+
+###occupancy heatmap
+mypal = colorNumeric(colorRamp(c('green', 'yellow', 'red')), df8$Numpass)
+
+heatmap <-leaflet(df8) %>% 
+  addTiles() %>% 
+  addHeatmap(lng = ~Lng, lat = ~Lat, intensity = ~Numpass,
+             blur = 20, max = 100, radius = 5, cellSize = 3) %>%     
+  addLegend(pal = mypal, values = df8$Numpass,
+            title="Occupancy")
+heatmap
+
+
+###speed heatmap
+mypal = colorNumeric(colorRamp(c('red', 'yellow', 'green')), df8$Speed)
+
+heatmap2 <-leaflet(df8) %>% 
+  addTiles() %>% 
+  addHeatmap(lng = ~Lng, lat = ~Lat, intensity = ~Speed,
+             blur = 20, max = 100, radius = 5, cellSize = 3) %>%     
+  addLegend(pal = mypal, values = df8$Speed,
+            title="Vehicle Speed")
+heatmap2
+
